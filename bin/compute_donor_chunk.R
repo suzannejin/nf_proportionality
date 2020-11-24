@@ -92,17 +92,21 @@ library(doMC)
 blocks2combs <- function(counts, n){
 
   # define blocks
+  # the resulting chunks will have size of at most [n, n]
   nblocks = ncol(counts) %/% n
   ngroup <- rep(1:nblocks, each = n)
   leftover <- ncol(counts) - length(ngroup)
   if(leftover > 0) ngroup <- c(ngroup, rep(nblocks + 1, leftover))
 
   # check size
+  # here I decided to stop computation if no more than 2 groups are generated (so only 1 chunk)
+  # so if this happens you better change n
   if (length(unique(ngroup)) <= 2){
     stop(paste("ERROR: chunk size ", n, " is too big for data frame of size [", nrow(counts), "][", ncol(counts), "]", sep=""))
   }
 
   # split groups
+  # each row in combs define a chunk
   split <- split(1:ncol(counts), ngroup)
   combs <- expand.grid(1:length(split), 1:length(split))
   combs <- t(apply(combs, 1, sort))
@@ -115,71 +119,50 @@ blocks2combs <- function(counts, n){
 }
 
 chunk2propr <- function(i, chunk, metric="rho", ivar=NA, symmetrize=FALSE,
-                        alpha, p=100, interval=seq(0.4,0.95,0.01) ){
+                        alpha, p=100, interval=seq(0.4,0.95,0.01), fdr=0.05 ){
 
   print(i)
 
-  # compute propr chunk
+  # compute propr for chunk
   rho.i <- propr(chunk, metric = metric, ivar = ivar, alpha = alpha, p=p)
   rho.i <- updateCutoffs(rho.i,interval)
 
-  # get cutoff
-  cutoff <- min(rho.i@fdr[,"cutoff"][which(rho.i@fdr[,"FDR"]<.05)])
+  # get cutoff | fdr
+  df <- data.frame('cutoff'=rho.i@fdr[,'cutoff'], 'FDR'=rho.i@fdr[,'FDR'])
 
-  # update interval and recompute, if no reasonable cutoff
-  icut = 1
-  while(cutoff==Inf && icut<5){
-    m <- max(interval)
-    b <- (interval[2]-interval[1])/10
-    print(paste("Re-updating cutoff using a different interval (", m, ",", 1-b, ",", b, ")", sep=""))
-    interval <- seq(m, 1-b, b)
-    rho.i <- updateCutoffs(rho.i,interval)
-    cutoff <- min(rho.i@fdr[,"cutoff"][which(rho.i@fdr[,"FDR"]<.05)])
-    icut = icut+1
-  }
-  if(cutoff==Inf){
-    m <- min(rho.i@fdr[,"FDR"])
-    stop(paste("No cutoff for FDR < 0.05, minimum = ", m, sep=""))
-  }
-
-  # get fdr at cutoff
-  fdr <- rho.i@fdr[,"FDR"][which(rho.i@fdr[,"cutoff"]==cutoff)]
-  print(paste("Obtained cutoff[", cutoff, "] and fdr[", fdr, "] for chunk ", i, sep=""))
-
-  return(list(rho.i@matrix, cutoff, fdr))
+  return(list(rho.i@matrix, df))
 }
 
-chunk2full <- function(counts, RES, split, combs){
+chunk2full <- function(counts, RES, split, combs, fdr){
   
   # define variables
   QUILT <- matrix(0, ncol(counts), ncol(counts))
-  cutoff <- 0.0
-  fdr <- 0.0
+  d <- data.frame('cutoff'=RES[[1]][[2]][,'cutoff'])
 
   # collect chunks
   for(i in 1:nrow(combs)){
 
-    # update cutoff and fdr
-    cutoff <- cutoff + RES[[i]][[2]]
-    fdr <- fdr + RES[[i]][[3]]
+    # add fdr.i
+    d[paste('FDR', i, sep="")] <- RES[[i]][[2]][,'FDR']
 
-    # Fill final matrix with each job
+    # Fill final matrix with each chunk
     batch1 <- split[[combs[i,1]]]
     batch2 <- split[[combs[i,2]]]
     patch.i <- c(batch1, batch2)
     QUILT[patch.i, patch.i] <- RES[[i]][[1]]
   }
 
-  # average cutoff and fdr
-  cutoff <- cutoff / i
-  fdr <- fdr / i
+  # average fdr
+  df <- data.frame('cutoff'=RES[[1]][[2]][,'cutoff'], 'FDR'=round(rowSums(d[,2:ncol(d)])/i,4))
+  # cutoff
+  cutoff <- min(df[df[,"FDR"]<fdr,"cutoff"])
 
   # rename columns & rows
   matrix <- QUILT
   rownames(matrix) <- colnames(counts)
   colnames(matrix) <- colnames(counts)
 
-  return(list(matrix, cutoff, fdr))
+  return(list(matrix, cutoff, df))
 }
 
 file2res <- function(RES, combs, dir){
@@ -193,15 +176,20 @@ file2res <- function(RES, combs, dir){
     RES[[i]][[1]] <- matrix
   }
 
+  # remove tmp files
+  unlink(dir2, recursive=TRUE)
+
   return(RES)
 }
 
 propr.chunk <- function(counts, metric = c("rho", "phi", "phs", "cor", "vlr"),
-                        ivar = "clr", symmetrize = FALSE, alpha, p=100,
+                        ivar = NA, symmetrize = FALSE, alpha=NA, p=100, fdr=0.05,
                         n=100, ncores = 1, interval=seq(0.3,0.95,0.01),
                         dir = NA){
   
   # divide data into chunks
+  # I recommend using large chunk size n,
+  # otherwise dividing the data into too many chunks will slow down the computation
   l <- blocks2combs(counts, n)
   combs <- l[[1]]
   split <- l[[2]]
@@ -215,13 +203,13 @@ propr.chunk <- function(counts, metric = c("rho", "phi", "phs", "cor", "vlr"),
     # get chunk
     batch1 <- split[[combs[i,1]]]
     batch2 <- split[[combs[i,2]]]
-    chunk = subset(clr, select = c(batch1, batch2))
+    chunk = subset(counts, select = c(batch1, batch2))
 
     # compute propr 
-    l_propr <- chunk2propr(i, chunk, metric=metric, ivar=ivar, symmetrize=symmetrize, alpha=alpha, p=p, interval=interval)
+    l_propr <- chunk2propr(i, chunk, metric=metric, ivar=ivar, symmetrize=symmetrize, alpha=alpha, p=p, interval=interval, fdr=fdr)
 
     if(is.na(dir)){
-      # return propr matrix, cutoff, and concrete FDR
+      # return propr matrix, cutoff, and FDR
       l_propr
     }else{
       # save data if required
@@ -230,7 +218,7 @@ propr.chunk <- function(counts, metric = c("rho", "phi", "phs", "cor", "vlr"),
       write.csv(l_propr[[1]], file=file2)
 
       # return cutoff and FDR
-      list(NULL, l_propr[[2]], l_propr[[3]])
+      list(NULL, l_propr[[2]])
     }
   }
 
@@ -240,7 +228,7 @@ propr.chunk <- function(counts, metric = c("rho", "phi", "phs", "cor", "vlr"),
   }
 
   # merge chunks
-  l_propr <- chunk2full(counts, RES, split, combs)
+  l_propr <- chunk2full(counts, RES, split, combs, fdr)
 
   return(l_propr)
 }
@@ -395,7 +383,4 @@ writeLines(as.character(cutoff), out2)
 
 # fdr
 out3 = file.path(opt$outdir, paste(basedonor, "_fdr.txt", sep=""))
-writeLines(as.character(fdr), out3)
-
-# remove tmp files
-unlink(dir2, recursive=TRUE)
+write.table(ch[[3]], out3, row.names = FALSE, quote=FALSE, sep=",", dec=".")
